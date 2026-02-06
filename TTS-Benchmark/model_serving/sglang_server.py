@@ -12,8 +12,9 @@ from typing import Any, Dict, Optional, Tuple, List
 import requests
 from openai import OpenAI
 from loguru import logger
-from model_serving.inference_helpers import infer_reasoning_parser, extract_boxed_text, extract_answer_int
+from model_serving.inference_helpers import infer_reasoning_parser, scan_for_answer, extract_last_boxed_content # , extract_answer_int, extract_boxed_text
 from model_serving.AIMO3_gptoss_python_tool import AIMO3Tool, AIMO3Sandbox  # adjust import path
+from math_verify import parse, verify
 # from model_serving.stateful_python_tool import PythonTool
 import argparse
 import uuid
@@ -49,6 +50,16 @@ def _safe_get(obj: Any, path: List[str], default=None):
         else:
             cur = getattr(cur, p, None)
     return cur if cur is not None else default
+
+def is_equiv(str1, str2, verbose=False):
+    if '$' not in str1:
+        str1 = '$' + str1 + '$'
+    if '$' not in str2:
+        str2 = '$' + str2 + '$'
+
+    gold = parse(str2)
+    pred = parse(str1)
+    return verify(gold, pred)
 
 class SGLangServer:
     """
@@ -168,16 +179,26 @@ class SGLangServer:
 
         # Initialize client
         self.client = OpenAI(base_url=self.openai_base_url, api_key="sk-local", timeout=self.timeout_s)
-        self.sandbox_workers = 16
+        self.sandbox_workers = 8
         self.sandbox_timeout_s = 5.0  # how long generate() waits for a sandbox from the pool
 
         # use python_tool_timeout as default kernel timeout unless overridden later
         self.default_jupyter_timeout_s = 600.0
 
         self.tool_prompt = (
-            "Execute Python code in the sandbox. Write only Python code. "
-            "Use print(...) to show results."
-        )
+        'Use this tool to execute Python code for:\n'
+        '- Complex calculations that would be error-prone by hand\n'
+        '- Numerical verification of analytical results\n'
+        '- Generating examples or testing conjectures\n'
+        '- Visualizing problem structure when helpful\n'
+        '- Brute-force verification for small cases\n\n'
+        
+        'The environment is a stateful Jupyter notebook. Code persists between executions.\n'
+        'Always use print() to display results. Write clear, well-commented code.\n\n'
+        
+        'Remember: Code should support your mathematical reasoning, not replace it. '
+        'Explain what you\'re computing and why before running code.'
+    )
 
         self.sandbox_pool: queue.Queue[AIMO3Sandbox] = queue.Queue(maxsize=self.sandbox_workers)
         # Create 16 kernels, but only 4 in parallel at a time
@@ -197,7 +218,7 @@ class SGLangServer:
         )
 
 
-    def _initialize_kernels(self, workers: int, jupyter_timeout: float) -> None:
+    def _initialize_kernels_full_high_memory(self, workers: int, jupyter_timeout: float) -> None:
         logger.info(f"Initializing {workers} persistent Jupyter kernels...")
         t0 = time.time()
 
@@ -212,32 +233,46 @@ class SGLangServer:
                 self.sandbox_pool.put(sb)
         logger.info(f"Kernels initialized in {time.time() - t0:.2f}s")
 
+    def _initialize_kernels(self, workers: int, jupyter_timeout: float) -> None:
+        logger.info(f"Initializing {workers} persistent Jupyter kernels...")
+        t0 = time.time()
+
+        def _create_sandbox() -> AIMO3Sandbox:
+            return AIMO3Sandbox(timeout=jupyter_timeout)
+
+        create_parallelism = min(workers, 4)  # <= actually do what comment says
+        with ThreadPoolExecutor(max_workers=create_parallelism) as ex:
+            futures = [ex.submit(_create_sandbox) for _ in range(workers)]
+            for fut in as_completed(futures):
+                self.sandbox_pool.put(fut.result())
+
+        logger.info(f"Kernels initialized in {time.time() - t0:.2f}s")
+
         
 
     def _acquire_sandbox(self, timeout_s: float) -> AIMO3Sandbox:
-        # Fast path: already available
         try:
             return self.sandbox_pool.get(timeout=timeout_s)
         except queue.Empty:
-            pass
-
-        # Slow path: lazily create a new sandbox (bounded)
-        with self._sandbox_create_lock:
-            if self._sandbox_created < self.max_sandboxes:
-                self._sandbox_created += 1
-                return AIMO3Sandbox(timeout=timeout_s)  # or your jupyter timeout instead
-
-        # Otherwise, wait again (someone will return one)
-        return self.sandbox_pool.get(timeout=timeout_s)
+            raise TimeoutError(
+                f"No sandbox available within {timeout_s}s. "
+                f"pool_size={self.sandbox_pool.qsize()}/{self.sandbox_workers}"
+            )
+        
 
     def _release_sandbox(self, sandbox: AIMO3Sandbox) -> None:
         try:
-            sandbox.reset()
+            sandbox.close()
         except Exception:
-            # if reset fails, best effort: still return it; or drop it (your choice)
-            pass
-        self.sandbox_pool.put(sandbox)
+            logger.exception("Sandbox close failed; continuing with replacement.")
 
+        # Always replace with a fresh one so pool size stays stable
+        try:
+            self.sandbox_pool.put(AIMO3Sandbox(timeout=self.default_jupyter_timeout_s, preload="minimal"))
+        except Exception:
+            logger.exception("Failed to create replacement sandbox.")
+            # If you want, you can re-raise or just drop it.
+            raise
 
     @classmethod
     def start_server(
@@ -850,6 +885,7 @@ Remember that your task is to classify the difficulty, not to solve the problem.
         max_decode_iter = None
 
         wall_t0 = time.perf_counter()
+        sandbox = None
         python_tool = None
         cancelled_early = False
         try:
@@ -869,8 +905,12 @@ Remember that your task is to classify the difficulty, not to solve the problem.
                 }
             
             else:
-
-                python_tool = PythonTool(local_jupyter_timeout=python_tool_timeout)
+                sandbox = self._acquire_sandbox(self.sandbox_timeout_s)
+                python_tool = AIMO3Tool(
+                    local_jupyter_timeout=python_tool_timeout,
+                    tool_prompt=self.tool_prompt,
+                    sandbox=sandbox
+                    )
 
                 try:
                     messages = _apply_chat_template(prompt, python_tool)
@@ -993,7 +1033,7 @@ Remember that your task is to classify the difficulty, not to solve the problem.
                         
                         if last_message.recipient == "python":
                             tool_uses += 1
-                            print(f"🐍 Executing Python code...")
+                            # print(f"🐍 Executing Python code...")
 
                             # If majority found, don't execute tool
                             if _should_stop():
@@ -1049,10 +1089,9 @@ Remember that your task is to classify the difficulty, not to solve the problem.
                     }
 
                 finally:
-                    try:
-                        python_tool.close()
-                    except Exception:
-                        logger.exception("Failed to close python_tool")
+                    if sandbox is not None:
+                        self._release_sandbox(sandbox)
+                    
                 
                 return final_text, stats
 
@@ -1089,21 +1128,22 @@ Remember that your task is to classify the difficulty, not to solve the problem.
         max_workers: Optional[int] = 1,
         python_tool_timeout: float = 5.0,
         max_new_tokens: int = 8192,
+        # NEW:
+        return_early: bool = True,
     ) -> Tuple[List[str], List[Dict[str, Any]]]:
         """
-        Batch generation with early return when an answer class reaches majority_threshold.
+        Batch generation with majority voting.
 
-        - Runs gptoss_generate_with_python_tool_single_text_early_return in a thread pool.
-        - As each worker finishes, extract_answer_int(response) and count.
-        - If any count >= majority_threshold:
-            * set stop_event so in-flight workers stop ASAP (cooperative)
-            * cancel futures that haven't started
-            * return immediately
-        - Unfinished responses remain "" and their stats remain {}.
+        return_early=True  (default):
+            - same behavior as before: returns immediately when an answer reaches majority_threshold
+            - unfinished responses remain "" and stats remain {}
+            - cancels futures that haven't started (best effort) and shuts down executor non-blocking
 
-        Returns:
-            responses: List[str] aligned with prompts
-            stats:     List[Dict[str, Any]] aligned with prompts
+        return_early=False:
+            - when majority reached: set stop_event but DO NOT return
+            - continue draining futures fully (as_completed) so workers can exit cooperatively
+            and return their own stats (usually cancelled_early=True)
+            - no explicit future cancellation is performed (per request)
         """
         if not prompts:
             return [], []
@@ -1112,19 +1152,61 @@ Remember that your task is to classify the difficulty, not to solve the problem.
         responses: List[str] = [""] * n
         stats: List[Dict[str, Any]] = [{} for _ in range(n)]
 
-        # Shared cancellation signal across all workers
         stop_event = threading.Event()
 
-        # Majority-vote bookkeeping
-        counts = collections.Counter()
-        counts_lock = threading.Lock()
+        clusters: List[Dict[str, Any]] = []   # each: {"rep": str, "count": int}
+        clusters_lock = threading.Lock()
 
-        if max_workers is None:
-            max_workers = 1
-        if max_workers < 1:
+        if max_workers is None or max_workers < 1:
             max_workers = 1
 
         shutdown_nonblocking_called = False
+        majority_reached = False
+        majority_rep: Optional[str] = None
+
+        def _safe_is_equiv(a: str, b: str) -> bool:
+            try:
+                return bool(is_equiv(a, b))
+            except Exception:
+                return False
+
+        def _extract_pred_rep(text: str) -> Optional[str]:
+            """
+            Prefer boxed content (supports non-integers).
+            Fallback to scan_for_answer (integer) -> string.
+            """
+            rep = extract_last_boxed_content(text)
+            if rep is not None:
+                rep = rep.strip()
+                if rep:
+                    return rep
+
+            # fallback: old integer extractor
+            ans_int = scan_for_answer(text)
+            if ans_int is not None:
+                return str(ans_int)
+
+            return None
+
+        def _update_clusters_and_check_majority(rep: str) -> Tuple[bool, str]:
+            """
+            Add rep into an existing equivalence class or create a new one.
+            Returns (reached_majority, majority_rep_for_class_if_reached_else_rep_or_existing_rep).
+            Caller must hold clusters_lock.
+            """
+            # Try to place into existing cluster
+            for c in clusters:
+                if _safe_is_equiv(rep, c["rep"]):
+                    c["count"] += 1
+                    if c["count"] >= majority_threshold:
+                        return True, c["rep"]
+                    return False, c["rep"]
+
+            # New cluster
+            clusters.append({"rep": rep, "count": 1})
+            if 1 >= majority_threshold:
+                return True, rep
+            return False, rep
 
         def _run_one(i: int, p: str) -> Tuple[int, str, Dict[str, Any]]:
             r, s = self.gptoss_generate_with_python_tool_single_text_early_return(
@@ -1135,8 +1217,6 @@ Remember that your task is to classify the difficulty, not to solve the problem.
                 reasoning_time=reasoning_time,
                 max_new_tokens=max_new_tokens,
             )
-
-            # i = index, r = response, s = stats
             return i, r, s
 
         ex = ThreadPoolExecutor(max_workers=max_workers)
@@ -1146,8 +1226,8 @@ Remember that your task is to classify the difficulty, not to solve the problem.
             futures = [ex.submit(_run_one, i, prompts[i]) for i in range(n)]
 
             for fut in as_completed(futures):
-                # If early-stop already triggered, return immediately.
-                if stop_event.is_set():
+                # If we are in "return early" mode, keep your existing behavior:
+                if return_early and stop_event.is_set():
                     for f in futures:
                         if not f.done():
                             f.cancel()
@@ -1160,41 +1240,372 @@ Remember that your task is to classify the difficulty, not to solve the problem.
                     responses[i] = r
                     stats[i] = s
 
-                    ans = extract_answer_int(r)  # your helper
-                    if ans is not None and isinstance(ans, int) and ans >= 0:
-                        with counts_lock:
-                            counts[ans] += 1
-                            if counts[ans] >= majority_threshold:
-                                # Trigger cooperative early stop
-                                stop_event.set()
+                    # Only attempt majority vote if not already reached (small optimization)
+                    if not majority_reached:
+                        rep = _extract_pred_rep(r)
+                        if rep is not None:
+                            with clusters_lock:
+                                reached, rep0 = _update_clusters_and_check_majority(rep)
+                                if reached:
+                                    majority_reached = True
+                                    majority_rep = rep0
+                                    stop_event.set()
 
-                                # Cancel futures not yet started
-                                for f in futures:
-                                    if f is not fut and not f.done():
-                                        f.cancel()
-
-                                # Non-blocking shutdown; running calls can't be killed,
-                                # but they will see stop_event and exit ASAP between steps.
-                                ex.shutdown(wait=False, cancel_futures=True)
-                                shutdown_nonblocking_called = True
-                                return responses, stats
+                                    if return_early:
+                                        # Same behavior as now: cancel what we can, return immediately
+                                        for f in futures:
+                                            if f is not fut and not f.done():
+                                                f.cancel()
+                                        ex.shutdown(wait=False, cancel_futures=True)
+                                        shutdown_nonblocking_called = True
+                                        return responses, stats
+                                    # else: do NOT cancel; continue draining futures so workers return stats
 
                 except Exception as e:
-                    # Best effort: try to record something.
-                    # We don't always know the index if it failed before returning.
-                    # So just log and continue.
                     logger.error(f"Batch worker failed: {e}\n{traceback.format_exc()}")
 
-            # Finished normally (no early-stop)
+            # If return_early=False, we intentionally reach here after draining all futures.
             return responses, stats
 
         finally:
-            # Don't block if we already did a nonblocking shutdown for early return
             if not shutdown_nonblocking_called:
                 try:
                     ex.shutdown(wait=True, cancel_futures=False)
                 except Exception:
                     pass
+        
+
+    def gptoss_generate_with_python_tool_batch_text_early_return_integers_only(
+        self,
+        prompts: List[str],
+        majority_threshold: int,
+        reasoning_budget: int = 125000,
+        reasoning_time: Optional[float] = None,
+        max_workers: Optional[int] = 1,
+        python_tool_timeout: float = 5.0,
+        max_new_tokens: int = 8192,
+        # NEW:
+        return_early: bool = True,
+    ) -> Tuple[List[str], List[Dict[str, Any]]]:
+        """
+        Batch generation with majority voting.
+
+        return_early=True  (default):
+            - same behavior as before: returns immediately when an answer reaches majority_threshold
+            - unfinished responses remain "" and stats remain {}
+            - cancels futures that haven't started (best effort) and shuts down executor non-blocking
+
+        return_early=False:
+            - when majority reached: set stop_event but DO NOT return
+            - continue draining futures fully (as_completed) so workers can exit cooperatively
+            and return their own stats (usually cancelled_early=True)
+            - no explicit future cancellation is performed (per request)
+        """
+        if not prompts:
+            return [], []
+
+        n = len(prompts)
+        responses: List[str] = [""] * n
+        stats: List[Dict[str, Any]] = [{} for _ in range(n)]
+
+        stop_event = threading.Event()
+
+        counts = collections.Counter()
+        counts_lock = threading.Lock()
+
+        if max_workers is None or max_workers < 1:
+            max_workers = 1
+
+        shutdown_nonblocking_called = False
+        majority_reached = False
+        majority_answer: Optional[int] = None
+
+        def _run_one(i: int, p: str) -> Tuple[int, str, Dict[str, Any]]:
+            r, s = self.gptoss_generate_with_python_tool_single_text_early_return(
+                prompt=p,
+                stop_event=stop_event,
+                reasoning_budget=reasoning_budget,
+                python_tool_timeout=python_tool_timeout,
+                reasoning_time=reasoning_time,
+                max_new_tokens=max_new_tokens,
+            )
+            return i, r, s
+
+        ex = ThreadPoolExecutor(max_workers=max_workers)
+        futures: List[Future] = []
+
+        try:
+            futures = [ex.submit(_run_one, i, prompts[i]) for i in range(n)]
+
+            for fut in as_completed(futures):
+                # If we are in "return early" mode, keep your existing behavior:
+                if return_early and stop_event.is_set():
+                    for f in futures:
+                        if not f.done():
+                            f.cancel()
+                    ex.shutdown(wait=False, cancel_futures=True)
+                    shutdown_nonblocking_called = True
+                    return responses, stats
+
+                try:
+                    i, r, s = fut.result()
+                    responses[i] = r
+                    stats[i] = s
+
+                    # Only attempt majority vote if not already reached (small optimization)
+                    if not majority_reached:
+                        ans = scan_for_answer(r)
+                        if ans is not None and isinstance(ans, int) and ans >= 0:
+                            with counts_lock:
+                                counts[ans] += 1
+                                if counts[ans] >= majority_threshold:
+                                    majority_reached = True
+                                    majority_answer = ans
+                                    stop_event.set()
+
+                                    if return_early:
+                                        # Same behavior as now: cancel what we can, return immediately
+                                        for f in futures:
+                                            if f is not fut and not f.done():
+                                                f.cancel()
+                                        ex.shutdown(wait=False, cancel_futures=True)
+                                        shutdown_nonblocking_called = True
+                                        return responses, stats
+                                    # else: do NOT cancel; continue draining futures so workers return stats
+
+                except Exception as e:
+                    logger.error(f"Batch worker failed: {e}\n{traceback.format_exc()}")
+
+            # If return_early=False, we intentionally reach here after draining all futures.
+            return responses, stats
+
+        finally:
+            if not shutdown_nonblocking_called:
+                try:
+                    ex.shutdown(wait=True, cancel_futures=False)
+                except Exception:
+                    pass
+                
+    def gptoss_generate_from_prompt(
+        self,
+        prompt: str,
+        *,
+        system_identity: Optional[str] = None,
+        developer_instructions: Optional[str] = None,
+        estimate_reasoning: str = "medium",
+        max_tokens: int = 4096,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        seed: Optional[int] = None,
+        time_budget_s: float = 360.0,
+        return_meta: bool = False,
+    ) -> str | Tuple[str, Dict[str, Any]]:
+        """
+        POST directly to SGLang /generate with Harmony input_ids, and parse output_ids back into Harmony messages.
+
+        This avoids relying on client.completions.create() returning token_ids.
+        """
+
+        if temperature is None:
+            temperature = float(self.temperature)
+        if top_p is None:
+            top_p = float(self.top_p)
+        if seed is None:
+            seed = int(self.random_seed)
+
+        _HARMONY_ENC = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+        stop_token_ids = _HARMONY_ENC.stop_tokens_for_assistant_actions()
+
+        # ----- Build Harmony messages -----
+        system_content = (
+            SystemContent.new()
+            .with_conversation_start_date(datetime.datetime.now().strftime("%Y-%m-%d"))
+            .with_reasoning_effort(
+                reasoning_effort=self.gptoss_get_estimate_reasoning_effort_enum(estimate_reasoning)
+            )
+        )
+        if system_identity:
+            system_content = system_content.with_model_identity(system_identity)
+
+        messages: List[Message] = [Message.from_role_and_content(Role.SYSTEM, system_content)]
+
+        if developer_instructions:
+            developer_content = DeveloperContent.new().with_instructions(developer_instructions)
+            messages.append(Message.from_role_and_content(Role.DEVELOPER, developer_content))
+
+        messages.append(Message.from_role_and_content(Role.USER, prompt))
+
+        prompt_ids = _HARMONY_ENC.render_conversation_for_completion(
+            Conversation.from_messages(messages),
+            Role.ASSISTANT,
+        )
+
+        # ----- Direct /generate call (returns output_ids) -----
+        def _sglang_generate_with_ids(
+            base_url: str,
+            prompt_ids: list[int],
+            *,
+            max_new_tokens: int,
+            temperature: float,
+            top_p: float,
+            stop_token_ids: list[int],
+            seed: int,
+            timeout_s: float,
+        ) -> Tuple[str, List[int], Dict[str, Any]]:
+            payload = {
+                "input_ids": list(map(int, prompt_ids)),
+                "rid": str(uuid.uuid4()),
+                "sampling_params": {
+                    "max_new_tokens": int(max_new_tokens),
+                    "temperature": float(temperature),
+                    "top_p": float(top_p),
+                    "stop_token_ids": list(map(int, stop_token_ids)),
+                    # "seed": int(seed),
+                    # Keep Harmony markers in decoding
+                    "skip_special_tokens": False,
+                    "spaces_between_special_tokens": False,
+                    # Optional: don’t trim stop tokens from decoded text
+                    "no_stop_trim": True,
+                },
+                "stream": False,
+            }
+
+            r = requests.post(f"{base_url.rstrip('/')}/generate", json=payload, timeout=timeout_s)
+            if r.status_code == 400:
+                # SGLang tends to include the real reason in body
+                raise RuntimeError(f"SGLang /generate returned 400: {r.text}")
+            r.raise_for_status()
+            data = r.json()
+
+            text = data.get("text", "")
+            output_ids = data.get("output_ids", None)
+            meta = data.get("meta_info", {}) or {}
+
+            if not output_ids:
+                raise RuntimeError(f"/generate returned no output_ids. keys={list(data.keys())} meta={meta!r}")
+
+            return text, list(map(int, output_ids)), meta
+
+        t0 = time.perf_counter()
+        text, output_ids, meta_info = _sglang_generate_with_ids(
+            self.native_base_url,
+            prompt_ids,
+            max_new_tokens=int(max_tokens),
+            temperature=float(temperature),
+            top_p=float(top_p),
+            stop_token_ids=stop_token_ids,
+            seed=int(seed),
+            timeout_s=float(time_budget_s),
+        )
+        elapsed = time.perf_counter() - t0
+
+        # ----- Parse Harmony messages back into structured messages -----
+        parsed_messages = _HARMONY_ENC.parse_messages_from_completion_tokens(
+            output_ids,
+            Role.ASSISTANT,
+        )
+
+        def _message_text(msg: Message) -> str:
+            if not getattr(msg, "content", None):
+                return ""
+            return "".join(
+                c.text
+                for c in msg.content
+                if isinstance(c, TextContent) and getattr(c, "text", None) is not None
+            )
+
+        final_text = ""
+        for msg in reversed(parsed_messages):
+            if getattr(msg, "channel", None) == "final":
+                final_text = _message_text(msg).strip()
+                break
+
+        if not final_text and parsed_messages:
+            final_text = _message_text(parsed_messages[-1]).strip()
+
+        if not return_meta:
+            return final_text
+
+        # meta_info from /generate is often richer than OpenAI usage()
+        meta: Dict[str, Any] = {
+            "elapsed_s": elapsed,
+            "sglang_meta_info": meta_info,
+            "prompt_len_tokens": len(prompt_ids),
+            "output_len_tokens": len(output_ids),
+            # "raw_text": text,  # decoded text as returned by /generate (may include special tokens)
+            # "parsed_messages": parsed_messages,
+        }
+        return final_text, meta
+    
+    def gptoss_generate_from_prompts_batch(
+        self,
+        prompts: List[str],
+        *,
+        max_workers: Optional[int] = None,
+        # forward args to single-call method
+        system_identity: Optional[str] = None,
+        developer_instructions: Optional[str] = None,
+        estimate_reasoning: str = "medium",
+        max_tokens: int = 4096,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        seed: Optional[int] = None,
+        time_budget_s: float = 360.0,
+    ) -> Tuple[List[str], List[Dict[str, Any]]]:
+        """
+        Batch-generate using ThreadPoolExecutor.
+
+        Returns:
+        final_texts: list[str]
+        metas: list[dict]
+        where final_texts[i] and metas[i] correspond to prompts[i].
+        """
+
+        n = len(prompts)
+        if n == 0:
+            return [], []
+
+        if max_workers is None:
+            # sensible default: avoid oversubscribing; tune as you like
+            max_workers = min(32, n)
+
+        final_texts: List[str] = [""] * n
+        metas: List[Dict[str, Any]] = [{} for _ in range(n)]
+
+        def _one(idx: int, prompt: str) -> Tuple[int, str, Dict[str, Any]]:
+            try:
+                text, meta = self.gptoss_generate_from_prompt(
+                    prompt,
+                    system_identity=system_identity,
+                    developer_instructions=developer_instructions,
+                    estimate_reasoning=estimate_reasoning,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    seed=seed,
+                    time_budget_s=time_budget_s,
+                    return_meta=True,
+                )
+                # meta should already be a dict, but ensure it
+                if not isinstance(meta, dict):
+                    meta = {"_warning": "meta_not_dict", "meta_repr": repr(meta)}
+                return idx, text, meta
+            except Exception as e:
+                # keep alignment: return empty text and error meta for this idx
+                return idx, "", {
+                    "error": True,
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                }
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(_one, i, p): i for i, p in enumerate(prompts)}
+            for fut in as_completed(futures):
+                idx, text, meta = fut.result()
+                final_texts[idx] = text
+                metas[idx] = meta
+
+        return final_texts, metas
 
 
     def shutdown(self) -> None:
@@ -1203,6 +1614,17 @@ Remember that your task is to classify the difficulty, not to solve the problem.
         self.stop_server()
 
 def main():
+    from math_verify import parse, verify
+
+    import importlib
+    mv = importlib.import_module("math_verify")
+
+    v = getattr(mv, "__version__", None)
+    if v is None:
+        from importlib.metadata import version as pkg_version
+        v = pkg_version("math_verify")
+
+    print(v)
     ap = argparse.ArgumentParser()
 
 
@@ -1323,13 +1745,13 @@ def main():
 
     for qi, q in enumerate(questions, start=1):
         final_prompt = q["problem"] + "\n" + format_prompt
-        prompts = [final_prompt] * 16
+        prompts = [final_prompt] * 4
 
         logger.info(f"[Q{qi}] id={q['id']} running batch: n_prompts=8, majority_threshold=4")
 
         responses, batch_stats = inference_engine.gptoss_generate_with_python_tool_batch_text_early_return(
             prompts=prompts,
-            majority_threshold=16,
+            majority_threshold=4,
             reasoning_budget=args.reasoning_budget,
             reasoning_time=None,
             max_workers=4,
@@ -1342,7 +1764,7 @@ def main():
             logger.info(r)
 
         # Log the extracted boxed answers (blanks remain blanks)
-        final_answers = [extract_boxed_text(r) for r in responses]
+        final_answers = [scan_for_answer(r) for r in responses]
         logger.info(f"[Q{qi}] final boxed answers (8 samples, blanks kept): {final_answers}")
 
         # If you ALSO want to see which ones were blank:
