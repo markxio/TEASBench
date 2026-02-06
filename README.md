@@ -10,109 +10,63 @@ Uniting Models, Algorithms, and System Innovators with Top-Down Evolutionary Ben
 |----------|-------------|
 | **MoE-Benchmark** | Benchmarks for Mixture-of-Experts models |
 | **TTS-Benchmark** | Benchmarks for Test-Time Scaling methods |
+| **Agentic-Benchmark** | Benchmark for Agentic Workflows (Under construction) |
 
-> **Note:** Currently tested on Kubernetes clusters with NVIDIA GPU support.
+## Core Components
 
-## Prerequisites
+Most of our benchmarking code is developed in the following projects:
 
-- Kubernetes cluster with GPU nodes
-- `kubectl` configured to access your cluster
-- PersistentVolumeClaim named `model-pvc` for model storage
-- Docker installed (for building custom benchmark containers)
+| Component | Repository | Description |
+|-----------|------------|-------------|
+| **MoE-CAP** | [GitHub](https://github.com/Auto-CAP/MoE-CAP.git) | MoE benchmarking framework (~4K LoC, Python) |
+| **AgentCAP**| [GitHub](https://github.com/Jingxue9/AgentCAP) | Agentic Workflow benchmarking framework (currently ~3K LoC, Python) |
+| **ServerlessLLM + Pylet** | [GitHub](https://github.com/ServerlessLLM/ServerlessLLM/tree/v1-beta) | Benchmark platform (~103K LoC, Python + C++) |
 
 ## Quick Start
 
-### Step 1: Build Your Docker Container
+### Option 1: Direct Testing
 
-Create a Docker container with your testing scripts and ServerlessLLM installed.
+Run benchmarks directly using Python scripts without any infrastructure setup.
 
-Your container must have ServerlessLLM installed:
+> **Note:** Direct test scripts are developed and tested on Kubernetes clusters with NVIDIA GPU support. They currently only work on Kubernetes environments.
 
+**Prerequisites:**
+- Python 3.10+
+- GPU with sufficient VRAM for the model
+
+**Installation:**
+
+**For SGLang backend:**
 ```bash
-pip install serverlessllm
+conda create -n sglang python=3.10 -y
+conda activate sglang
+pip install sglang==0.5.8 transformers datasets
 ```
 
-**Supported Backends:**
-- `vllm` - Standard vLLM backend
-- `sglang` - Standard SGLang backend  
-- `moe-cap-sglang` - MoE-CAP optimized SGLang backend
-- `moe-cap-vllm` - MoE-CAP optimized vLLM backend
-
-### Step 2: Create Model Deployment Config
-
-Add a deployment configuration JSON file like those in `config_examples/`. This defines how your model will be deployed.
-
-See example: [`config_examples/sglang-moe-qwen3-30b-1worker-4gpu.json`](config_examples/sglang-moe-qwen3-30b-1worker-4gpu.json)
-
-**Config Fields:**
-| Field | Description |
-|-------|-------------|
-| `model` | HuggingFace model name |
-| `backend` | One of: `vllm`, `sglang`, `moe-cap-sglang`, `moe-cap-vllm` |
-| `num_gpus` | Number of GPUs per model instance |
-| `tensor_parallel_size` | Tensor parallelism degree |
-| `max_instances` | Maximum number of model instances that can run concurrently |
-| `keep_alive` | Time in seconds the instance stays alive before being deleted after idle |
-
-**Note on `max_instances`:** This depends on your deployment's total GPU capacity. For example, if you have 4 workers × 2 GPUs each (8 GPUs total) and each model instance requires 2 GPUs, you can set `max_instances = 4`.
-
-
-### Step 3: Write K8s Benchmark Job YAML
-
-Create a Kubernetes Job YAML in `MoE-Benchmark/` that runs your benchmark.
-
-See example: [`MoE-Benchmark/sglang-qwen3-30b-moe-gsm8k.yaml`](MoE-Benchmark/sglang-qwen3-30b-moe-gsm8k.yaml)
-
-### Step 4: Deploy the ServerlessLLM Infrastructure
-
-Deploy the SLLM infrastructure (head nodes and GPU workers):
-
-**Example: 1 Worker with 4 H100 GPUs**
-
+**For vLLM backend:**
 ```bash
-kubectl apply -f deployments/sllm-deployment-1-worker-4-H100.yaml
+conda create -n vllm python=3.10 -y
+conda activate vllm
+pip install vllm==0.11.0 transformers==4.56.0 datasets
 ```
 
-Wait for all pods to be ready:
+### Option 2: Serverless Deployment
 
-```bash
-kubectl get pods -w
-```
+For Kubernetes-based serverless deployment with auto-scaling, see the detailed guide:
 
-You should see:
-- `pylet-head-xxx` - Running
-- `sllm-head-xxx` - Running  
-- `pylet-worker-0-xxx` - Running
+**[Serverless Deployment Guide](serverless_deployments/README.md)**
 
-### Step 5: Run the Benchmark
+> **Note:** Serverless scripts are developed and tested on Kubernetes clusters with NVIDIA GPU support. They currently only work on Kubernetes environments.
 
-Once all deployments are ready, run the benchmark job:
+This approach is recommended for:
+- Production deployments
+- Multi-model serving
+- Auto-scaling based on load
+- Kubernetes-native infrastructure
 
-```bash
-kubectl create -f MoE-Benchmark/sglang-qwen3-30b-moe-gsm8k.yaml
-```
+## Contributing
 
-The benchmark job will:
-1. Wait for the head nodes to be ready
-2. Deploy the Qwen3-30B-A3B MoE model
-3. Run evaluation on the GSM8K dataset
-4. Save results to `/models/moecap_results`
-
-### Step 6: Check Results
-
-Monitor the benchmark progress:
-
-```bash
-kubectl logs -f job/sllm-benchmark-xxxxx
-```
-
-Results are saved to the PVC at `/models/moecap_results`.
-
-## Cleanup
-
-To remove the deployment:
-
-```bash
-kubectl delete -f deployments/sllm-deployment-1-worker-4-H100.yaml
-kubectl delete job -l app=sllm-benchmark
-```
+1. Add new benchmark scripts to the appropriate category folder
+2. For direct tests, add to `<Category>/direct-test-scripts/`
+3. For serverless tests, add to `<Category>/serverless-scripts/`
+4. Update documentation as needed
